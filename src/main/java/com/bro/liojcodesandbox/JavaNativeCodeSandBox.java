@@ -3,12 +3,14 @@ package com.bro.liojcodesandbox;
 import cn.hutool.core.io.FileUtil;
 import cn.hutool.core.io.resource.ResourceUtil;
 import cn.hutool.core.util.StrUtil;
+import cn.hutool.dfa.FoundWord;
+import cn.hutool.dfa.WordTree;
 import com.bro.liojcodesandbox.model.ExecuteCodeRequest;
 import com.bro.liojcodesandbox.model.ExecuteCodeResponse;
 import com.bro.liojcodesandbox.model.ExecuteMessage;
 import com.bro.liojcodesandbox.model.JudgeInfo;
+import com.bro.liojcodesandbox.security.DefaultSecurityManager;
 import com.bro.liojcodesandbox.utils.ProccessUtils;
-import org.springframework.util.StopWatch;
 
 import java.io.File;
 import java.nio.charset.StandardCharsets;
@@ -16,7 +18,6 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
-import java.util.stream.Collectors;
 
 public class JavaNativeCodeSandBox implements CodeSandBox {
 
@@ -24,12 +25,26 @@ public class JavaNativeCodeSandBox implements CodeSandBox {
 
     public static final String GLOBAL_JAVA_CLASS_NAME = "Main.java";
 
+    public static final long TIME_OUT = 5000L;
+
+    public static final List<String> blackList = Arrays.asList("Files","exec");
+
+    public static final WordTree wordTree;
+
+    static {
+        //初始化字典树
+        wordTree = new WordTree();
+        wordTree.addWords(blackList);
+
+    }
 
     public static void main(String[] args) {
         JavaNativeCodeSandBox javaNativeCodeSandBox = new JavaNativeCodeSandBox();
         ExecuteCodeRequest executeCodeRequest = new ExecuteCodeRequest();
         executeCodeRequest.setInputList(Arrays.asList("1 2","3 4"));
         String code = ResourceUtil.readStr("testCode/simpleComputeArgs/Main.java", StandardCharsets.UTF_8);
+        //String code = ResourceUtil.readStr("testCode/unsafeCode/SleepError.java", StandardCharsets.UTF_8);
+
         executeCodeRequest.setCode(code);
         executeCodeRequest.setLanguage("java");
         ExecuteCodeResponse executeCodeResponse = javaNativeCodeSandBox.executeCode(executeCodeRequest);
@@ -41,9 +56,17 @@ public class JavaNativeCodeSandBox implements CodeSandBox {
     @Override
     public ExecuteCodeResponse executeCode(ExecuteCodeRequest executeCodeRequest) {
 
+
         List<String> inputList = executeCodeRequest.getInputList();
         String code = executeCodeRequest.getCode();
         String language = executeCodeRequest.getLanguage();
+
+        //校验代码中是否包含黑名单中的命令
+        FoundWord foundWord = wordTree.matchWord(code);
+        if(foundWord != null){
+            System.out.println("包含禁止词"+foundWord.getFoundWord());
+            return null;
+        }
 
         //将代码保存为文件
         String userDir = System.getProperty("user.dir");
@@ -73,9 +96,19 @@ public class JavaNativeCodeSandBox implements CodeSandBox {
         //执行代码，得到结果
         List<ExecuteMessage> executeMessagesList =new ArrayList<>();
         for(String inputArgs : inputList){
-            String runCmd=String.format("java -Dfile.encoding=UTF-8 -cp %s Main %s",userCodeParentPath,inputArgs);
+            //设置JVM最大堆内存为256MB
+            String runCmd=String.format("java -Xmx256m   -Dfile.encoding=UTF-8 -cp %s Main %s",userCodeParentPath,inputArgs);
             try {
                 Process runProcess = Runtime.getRuntime().exec(runCmd);
+                //超时控制
+                new Thread(()->{
+                    try {
+                        Thread.sleep(TIME_OUT);
+                        runProcess.destroy();
+                    } catch (InterruptedException e) {
+                        throw new RuntimeException(e);
+                    }
+                }).start();
                 ExecuteMessage executeMessage = ProccessUtils.runProcessAndGetMessage(runProcess, "运行");
                 //ExecuteMessage executeMessage=ProccessUtils.runInteractProcessAndGetMessage(runProcess,"运行",inputArgs);
                 System.out.println(executeMessage);
