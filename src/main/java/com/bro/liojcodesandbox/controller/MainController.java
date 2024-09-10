@@ -21,7 +21,7 @@ public class MainController {
         return "OK";
     }
 
-    @PostMapping
+    @PostMapping("/executeCode")
     ExecuteCodeResponse executeCode(@RequestBody ExecuteCodeRequest executeCodeRequest){
         if(executeCodeRequest==null){
             throw new RuntimeException("请求参数为空");
