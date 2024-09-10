@@ -1,33 +1,28 @@
 package com.bro.liojcodesandbox;
 
-import cn.hutool.core.io.FileUtil;
-import cn.hutool.core.io.resource.ResourceUtil;
 import cn.hutool.core.util.ArrayUtil;
-import cn.hutool.core.util.StrUtil;
 import com.bro.liojcodesandbox.model.ExecuteCodeRequest;
 import com.bro.liojcodesandbox.model.ExecuteCodeResponse;
 import com.bro.liojcodesandbox.model.ExecuteMessage;
-import com.bro.liojcodesandbox.model.JudgeInfo;
-import com.bro.liojcodesandbox.utils.ProccessUtils;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.*;
 import com.github.dockerjava.api.model.*;
 import com.github.dockerjava.core.DockerClientBuilder;
 import com.github.dockerjava.core.command.ExecStartResultCallback;
+import org.springframework.stereotype.Component;
 import org.springframework.util.StopWatch;
 
 import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
-public class JavaDockerCodeSandBox implements CodeSandBox {
+@Component
+public class JavaDockerCodeSandBox extends JavaCodeSandBoxTemplate {
 
     public static final String GLOBAL_CODE_DIR_NAME = "tempCode";
 
@@ -38,52 +33,15 @@ public class JavaDockerCodeSandBox implements CodeSandBox {
     public static final Boolean FIRST_INIT=true;
 
 
-
-    public static void main(String[] args)  {
-        JavaDockerCodeSandBox javaNativeCodeSandBox = new JavaDockerCodeSandBox();
-        ExecuteCodeRequest executeCodeRequest = new ExecuteCodeRequest();
-        executeCodeRequest.setInputList(Arrays.asList("1 2","3 4"));
-        String code = ResourceUtil.readStr("testCode/simpleComputeArgs/Main.java", StandardCharsets.UTF_8);
-        //String code = ResourceUtil.readStr("testCode/unsafeCode/SleepError.java", StandardCharsets.UTF_8);
-
-        executeCodeRequest.setCode(code);
-        executeCodeRequest.setLanguage("java");
-        ExecuteCodeResponse executeCodeResponse = javaNativeCodeSandBox.executeCode(executeCodeRequest);
-
-        System.out.println(executeCodeResponse);
-    }
-
-
+    /**
+     * 3.创建容器，把文件复制到容器内
+     * @param userCodeFile
+     * @param inputList
+     * @return
+     */
     @Override
-    public ExecuteCodeResponse executeCode(ExecuteCodeRequest executeCodeRequest)  {
-
-        List<String> inputList = executeCodeRequest.getInputList();
-        String code = executeCodeRequest.getCode();
-        String language = executeCodeRequest.getLanguage();
-
-        //1.将代码保存为文件
-        String userDir = System.getProperty("user.dir");
-        String globalCodePathName = userDir + File.separator + GLOBAL_CODE_DIR_NAME;
-        //判断全局代码目录是否存在，没有就新建
-        if (!FileUtil.exist(globalCodePathName)) {
-            FileUtil.mkdir(globalCodePathName);
-        }
-        //把用户的代码隔离存放
-        String userCodeParentPath = globalCodePathName + File.separator + UUID.randomUUID();
-        String userCodePath = userCodeParentPath + File.separator + GLOBAL_JAVA_CLASS_NAME;
-        File userCodeFile = FileUtil.writeString(code, userCodePath, StandardCharsets.UTF_8);
-
-        //2.编译代码，得到class文件
-        String compileCmd = String.format("javac -encoding utf-8 %s", userCodeFile.getAbsolutePath());
-        try {
-            Process compileProcess = Runtime.getRuntime().exec(compileCmd);
-            //等待程序执行，获取错误码
-            ExecuteMessage executeMessage = ProccessUtils.runProcessAndGetMessage(compileProcess, "编译");
-            System.out.println(executeMessage);
-        } catch (Exception e) {
-            return getResponse(e);
-        }
-
+    public List<ExecuteMessage> runFile(File userCodeFile, List<String> inputList) {
+        String userCodeParentPath=userCodeFile.getParentFile().getAbsolutePath();
         //3.创建容器，上传编译文件
         DockerClient dockerClient = DockerClientBuilder.getInstance().build();
         String image="openjdk:8-alpine";
@@ -235,63 +193,9 @@ public class JavaDockerCodeSandBox implements CodeSandBox {
             executeMessage.setMemory(maxMemory[0]);
             executeMessagesList.add(executeMessage);
         }
-
-
-        //收集整理输出结果
-        ExecuteCodeResponse executeCodeResponse = new ExecuteCodeResponse();
-        List<String> outputList=new ArrayList<>();
-        //取用时最大值，便于判断是否超时
-        long maxTime=0;
-        for(ExecuteMessage executeMessage : executeMessagesList){
-            String errorMessage = executeMessage.getErrorMessage();
-            if(StrUtil.isNotBlank(errorMessage)){
-                executeCodeResponse.setMessage(errorMessage);
-                //执行中存在错误
-                executeCodeResponse.setStatus(3);
-                break;
-            }
-            outputList.add(executeMessage.getMessage());
-            Long time=executeMessage.getTime();
-            if(time!=null){
-                maxTime=Math.max(maxTime,time);
-            }
-        }
-        if(outputList.size()==executeMessagesList.size()){
-            //正常运行完成
-            executeCodeResponse.setStatus(1);
-        }
-        executeCodeResponse.setOutputList(outputList);
-        JudgeInfo judgeInfo =new JudgeInfo();
-        //judgeInfo.setMessage();
-        //需要借助第三方库来实现，此处不做实现
-        //judgeInfo.setMemory();
-        judgeInfo.setTime(maxTime);
-        executeCodeResponse.setJudgeInfo(judgeInfo);
-
-        //清理文件
-        if(userCodeFile.getParentFile()!=null){
-            boolean del = FileUtil.del(userCodeParentPath);
-            System.out.println("删除"+(del ? "成功":"失败"));
-        }
-
-        //删除容器
-        dockerClient.removeContainerCmd(containerId).withForce(true).exec();
-
-        return executeCodeResponse;
+        return executeMessagesList;
     }
 
 
-    /**
-     * 获取错误响应
-     * @param e
-     */
-    private ExecuteCodeResponse getResponse(Throwable e){
-        ExecuteCodeResponse executeCodeResponse = new ExecuteCodeResponse();
-        executeCodeResponse.setOutputList(new ArrayList<>());
-        executeCodeResponse.setMessage(e.getMessage());
-        //代表代码沙箱错误
-        executeCodeResponse.setStatus(2);
-        executeCodeResponse.setJudgeInfo(new JudgeInfo());
-        return executeCodeResponse;
-    }
+
 }
