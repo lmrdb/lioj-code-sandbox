@@ -1,15 +1,18 @@
 package com.bro.liojcodesandbox;
 
 import cn.hutool.core.util.ArrayUtil;
-import com.bro.liojcodesandbox.model.ExecuteCodeRequest;
+import cn.hutool.core.util.StrUtil;
 import com.bro.liojcodesandbox.model.ExecuteCodeResponse;
 import com.bro.liojcodesandbox.model.ExecuteMessage;
+import com.bro.liojcodesandbox.model.JudgeInfo;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.*;
 import com.github.dockerjava.api.model.*;
 import com.github.dockerjava.core.DockerClientBuilder;
 import com.github.dockerjava.core.command.ExecStartResultCallback;
+
+import org.apache.commons.lang3.StringUtils;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StopWatch;
 
@@ -17,8 +20,8 @@ import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 @Component
@@ -76,14 +79,14 @@ public class JavaDockerCodeSandBox extends JavaCodeSandBoxTemplate {
         //限制cpu
         hostConfig.withCpuCount(1L);
         //linux自带的安全管理配置，可以自行配置
-        hostConfig.withSecurityOpts(Arrays.asList("seccomp=安全管理字符串"));
+        //hostConfig.withSecurityOpts(Arrays.asList("seccomp=安全管理字符串"));
         //创建可交互的容器，能接受多次输入并输出
         CreateContainerResponse createContainerResponse = containerCmd
                 .withHostConfig(hostConfig)
                 //禁用网络
                 .withNetworkDisabled(true)
                 //限制用户不能往根目录写文件
-                .withReadonlyRootfs(true)
+                //.withReadonlyRootfs(true)
                 .withAttachStdin(true)
                 .withAttachStdout(true)
                 .withAttachStderr(true)
@@ -131,16 +134,17 @@ public class JavaDockerCodeSandBox extends JavaCodeSandBoxTemplate {
                 public void onNext(Frame frame) {
                     StreamType streamType = frame.getStreamType();
                     if(StreamType.STDERR.equals(streamType)){
-                        errorMessage[0] =new String(frame.getPayload());
+                        errorMessage[0] = (errorMessage[0] == null ? "" : errorMessage[0]) + new String(frame.getPayload());
                         System.out.println("输出错误结果："+ errorMessage[0]);
-                    }else {
-                        message[0] =new String(frame.getPayload());
+                    } else {
+                        message[0] = (message[0] == null ? "" : message[0]) + new String(frame.getPayload());
                         System.out.println("输出结果："+ message[0]);
                     }
                     super.onNext(frame);
                 }
             };
 
+            final CountDownLatch latch = new CountDownLatch(1);
             final long[] maxMemory = {0L};
             //获取占用的内存
             StatsCmd statsCmd = dockerClient.statsCmd(containerId);
@@ -149,7 +153,6 @@ public class JavaDockerCodeSandBox extends JavaCodeSandBoxTemplate {
                 public void onStart(Closeable closeable) {
 
                 }
-
                 @Override
                 public void onNext(Statistics statistics) {
                     Long memoryUsage = statistics.getMemoryStats().getUsage();
@@ -158,15 +161,14 @@ public class JavaDockerCodeSandBox extends JavaCodeSandBoxTemplate {
                         maxMemory[0] =Math.max(memoryUsage, maxMemory[0]);
                     }
                 }
-
                 @Override
                 public void onError(Throwable throwable) {
-
+                    latch.countDown();
                 }
 
                 @Override
                 public void onComplete() {
-
+                    latch.countDown();
                 }
 
                 @Override
@@ -175,6 +177,11 @@ public class JavaDockerCodeSandBox extends JavaCodeSandBoxTemplate {
                 }
             };
             statsCmd.exec(statisticsResultCallback);
+            try {
+                latch.await(1, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
             try {
                 stopWatch.start();
                 dockerClient.execStartCmd(execId)
@@ -187,15 +194,61 @@ public class JavaDockerCodeSandBox extends JavaCodeSandBoxTemplate {
                 System.out.println("程序执行异常");
                 throw new RuntimeException(e);
             }
-            executeMessage.setMessage(message[0]);
+            // 判断message是否为null，是否只有换行符
+            String resultMessage = message[0] != null ? message[0].replaceAll("\\r?\\n$", "") : null;
+            if (resultMessage != null && !resultMessage.isEmpty()) {
+                // 去掉尾部换行符，但保留其他字符
+                executeMessage.setMessage(resultMessage);
+            } else {
+                // 保留原始消息
+                executeMessage.setMessage(message[0]);
+            }
+            System.out.println("处理后输出结果"+message[0]);
             executeMessage.setErrorMessage(errorMessage[0]);
             executeMessage.setTime(time);
             executeMessage.setMemory(maxMemory[0]);
             executeMessagesList.add(executeMessage);
         }
+        dockerClient.removeContainerCmd(containerId).withForce(true).exec();
         return executeMessagesList;
     }
 
+    @Override
+    public ExecuteCodeResponse getOutputResponse(List<ExecuteMessage> executeMessagesList) {
+        ExecuteCodeResponse executeCodeResponse = new ExecuteCodeResponse();
+        List<String> outputList=new ArrayList<>();
+        //取用时最大值，便于判断是否超时
+        long maxTime=0;
+        long maxMemory=0;
+        for(ExecuteMessage executeMessage : executeMessagesList){
+            String errorMessage = executeMessage.getErrorMessage();
+            if(StrUtil.isNotBlank(errorMessage)){
+                executeCodeResponse.setMessage(errorMessage);
+                //执行中存在错误
+                executeCodeResponse.setStatus(3);
+                break;
+            }
+            outputList.add(executeMessage.getMessage());
 
-
+            Long time=executeMessage.getTime();
+            Long memory = executeMessage.getMemory();
+            if(memory!=null){
+                maxMemory=Math.max(maxTime,memory);
+            }
+            if(time!=null){
+                maxTime=Math.max(maxTime,time);
+            }
+        }
+        if(outputList.size()==executeMessagesList.size()){
+            //正常运行完成
+            executeCodeResponse.setStatus(1);
+        }
+        executeCodeResponse.setOutputList(outputList);
+        JudgeInfo judgeInfo =new JudgeInfo();
+        //judgeInfo.setMessage();
+        judgeInfo.setMemory(maxMemory);
+        judgeInfo.setTime(maxTime);
+        executeCodeResponse.setJudgeInfo(judgeInfo);
+        return executeCodeResponse;
+    }
 }
